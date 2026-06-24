@@ -125,6 +125,35 @@ const server = http.createServer((req, res) => {
     return;
   }
   
+  // API ENDPOINT: Read-only stats for internal dashboard (no apiKeys leaked)
+  if (parsedUrl.pathname === '/stats' && req.method === 'GET') {
+    maybeRollMessagesToday();
+    const groups = [];
+    for (const [group, s] of groupStats) {
+      groups.push({
+        group,
+        children: s.children,
+        masters: s.masters,
+        lastMessageAt: s.lastMessageAt,
+        messagesToday: s.messagesToday
+      });
+    }
+    res.writeHead(200, {"Content-Type": "application/json"});
+    res.end(JSON.stringify({
+      uptimeSeconds: Math.floor((Date.now() - serverStartedAt.getTime()) / 1000),
+      serverStartedAt: serverStartedAt.toISOString(),
+      groups: groups
+    }));
+    return;
+  }
+
+  // API ENDPOINT: Health check
+  if (parsedUrl.pathname === '/health' && req.method === 'GET') {
+    res.writeHead(200, {"Content-Type": "application/json"});
+    res.end(JSON.stringify({ status: "ok", uptimeSeconds: Math.floor((Date.now() - serverStartedAt.getTime()) / 1000) }));
+    return;
+  }
+
   // Default response
   res.writeHead(200, {"Content-Type": "text/plain"});
   res.end("ACE Relay: OK");
@@ -133,6 +162,30 @@ const server = http.createServer((req, res) => {
 // WebSocket server
 const wss = new WebSocket.Server({ server });
 const clients = new Map();
+
+// === Anti-abuse connection telemetry (additive, read-only; does NOT affect routing) ===
+const serverStartedAt = new Date();
+// Per-group counters: { children, masters, lastMessageAt, messagesToday }
+const groupStats = new Map();
+// Track the UTC date the messagesToday counters apply to, so they reset daily.
+let messagesTodayDate = new Date().toISOString().slice(0, 10);
+
+function statsFor(group) {
+  let s = groupStats.get(group);
+  if (!s) {
+    s = { children: 0, masters: 0, lastMessageAt: null, messagesToday: 0 };
+    groupStats.set(group, s);
+  }
+  return s;
+}
+
+function maybeRollMessagesToday() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== messagesTodayDate) {
+    messagesTodayDate = today;
+    for (const s of groupStats.values()) s.messagesToday = 0;
+  }
+}
 
 function send(ws, obj){ 
   try{ 
@@ -169,6 +222,17 @@ wss.on("connection", (ws, req) => {
   });
   
   console.log(`[+] ${role} connected to ${group} (strategy: ${strategy})`);
+
+  // Telemetry: bump per-group connection counters (does NOT affect routing).
+  const gs = statsFor(group);
+  if (role === "child") {
+    gs.children++;
+    if (gs.children > 1) {
+      console.log(`[ABUSE] group ${group} now has ${gs.children} concurrent children (apiKey ${key.substring(0, 6)}...) — possible license sharing`);
+    }
+  } else if (role === "master") {
+    gs.masters++;
+  }
   
   // Send confirmation
   send(ws, {
@@ -191,6 +255,12 @@ wss.on("connection", (ws, req) => {
       send(ws, { type: "heartbeat_ack" });
       return;
     }
+
+    // Telemetry: record activity for non-heartbeat messages (does NOT affect routing).
+    maybeRollMessagesToday();
+    const ms = statsFor(group);
+    ms.lastMessageAt = new Date().toISOString();
+    ms.messagesToday++;
     
     // Broadcast signals from master to children
     if (msg.type === "order" && role === "master") {
@@ -219,6 +289,12 @@ wss.on("connection", (ws, req) => {
   
   ws.on("close", () => {
     clients.delete(id);
+    // Telemetry: decrement per-group connection counters (does NOT affect routing).
+    const cs = groupStats.get(group);
+    if (cs) {
+      if (role === "child" && cs.children > 0) cs.children--;
+      else if (role === "master" && cs.masters > 0) cs.masters--;
+    }
     console.log(`[-] ${role} disconnected from ${group}`);
   });
   
