@@ -303,6 +303,23 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+// ── WebSocket keepalive ─────────────────────────────────────────────────────
+// Railway's edge proxy closes idle WebSocket connections (~once a minute), which
+// was silently dropping BoardShop child connections between signals — a child that
+// dropped and didn't reconnect missed the trade (this is what kept happening to one
+// user). Send a tiny ping frame to every open socket every 30s so the proxy sees the
+// connection as active and keeps it open. A ping is a few bytes — negligible load,
+// and ping-only (no force-terminate) so a client that doesn't auto-pong is never cut.
+const KEEPALIVE_MS = 30000;
+const keepAlive = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.ping(); } catch (_) { /* ignore */ }
+    }
+  });
+}, KEEPALIVE_MS);
+wss.on("close", () => clearInterval(keepAlive));
+
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
