@@ -312,11 +312,15 @@ wss.on("connection", (ws, req) => {
 // and ping-only (no force-terminate) so a client that doesn't auto-pong is never cut.
 const KEEPALIVE_MS = 30000;
 const keepAlive = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.ping(); } catch (_) { /* ignore */ }
-    }
-  });
+  // App-level ping (a small JSON the CHILD can actually see via ReceiveAsync) — lets the child
+  // detect a dead/half-open socket on an otherwise-silent connection and reconnect. Also send a
+  // protocol ws.ping() to every socket so the proxy keeps the connection alive. Both are tiny.
+  const pingMsg = JSON.stringify({ type: "ping", ts: Date.now() });
+  for (const c of clients.values()) {
+    if (!c.ws || c.ws.readyState !== WebSocket.OPEN) continue;
+    try { c.ws.ping(); } catch (_) { /* ignore */ }
+    if (c.role === "child") { try { c.ws.send(pingMsg); } catch (_) { /* ignore */ } }
+  }
 }, KEEPALIVE_MS);
 wss.on("close", () => clearInterval(keepAlive));
 
