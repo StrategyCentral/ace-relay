@@ -2,6 +2,12 @@ const http = require("http");
 const WebSocket = require("ws");
 const url = require("url");
 
+// Admin auth: /admin/* routes require this header. No fallback — if unset, admin routes are locked.
+const MASTER_API_KEY = process.env.MASTER_API_KEY;
+function adminAuthed(req) {
+  return MASTER_API_KEY && req.headers['x-master-key'] === MASTER_API_KEY;
+}
+
 const server = http.createServer((req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', 'https://acetradingbots.com');
@@ -20,6 +26,11 @@ const server = http.createServer((req, res) => {
   
   // API ENDPOINT: Active Connections
   if (parsedUrl.pathname === '/admin/active-connections' && req.method === 'GET') {
+    if (!adminAuthed(req)) {
+      res.writeHead(401, {"Content-Type": "application/json"});
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
     const connections = [];
     
     for (const [id, client] of clients) {
@@ -53,6 +64,11 @@ const server = http.createServer((req, res) => {
   
   // API ENDPOINT: Disconnect License
   if (parsedUrl.pathname === '/admin/disconnect-license' && req.method === 'POST') {
+    if (!adminAuthed(req)) {
+      res.writeHead(401, {"Content-Type": "application/json"});
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', () => {
