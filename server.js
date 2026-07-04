@@ -32,7 +32,7 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 // apiKeys (issued by /api/activate) won't validate here.
 function generateUserCredentials(licenseKey, strategy) {
   const strategyPrefix = strategy ? strategy.toLowerCase().replace(/[^a-z0-9]/g, '') : 'default';
-  const hash = crypto.createHash('sha256')
+  const hash = crypto.createHmac('sha256', process.env.CRED_SECRET || '')
     .update(licenseKey + strategyPrefix)
     .digest('hex');
   return {
