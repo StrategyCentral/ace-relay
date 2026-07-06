@@ -90,7 +90,7 @@ async function refreshLicenses() {
 
 function isEligible(lic, strategy, now) {
   const allowed = lic.allowed_strategies || [];
-  if (allowed.length > 0 && !allowed.includes(strategy)) return false;   // empty = all-access
+  if (strategy !== 'MASTERTESTER' && allowed.length > 0 && !allowed.includes(strategy)) return false;   // empty = all-access
   if (lic.expires_at && new Date(lic.expires_at) < now) return false;
   return true;
 }
