@@ -4,29 +4,76 @@ const WebSocket = require("ws");
 const url = require("url");
 const crypto = require("crypto");
 
+const processStartedAt = Date.now();
+
+// Constant-time string compare (hash both sides so unequal lengths don't leak via timing).
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 // Admin auth: /admin/* routes require this header. No fallback — if unset, admin routes are locked.
 const MASTER_API_KEY = process.env.MASTER_API_KEY;
 function adminAuthed(req) {
-  return MASTER_API_KEY && req.headers['x-master-key'] === MASTER_API_KEY;
+  return !!MASTER_API_KEY && safeEqual(String(req.headers['x-master-key'] || ''), MASTER_API_KEY);
+}
+
+// GET /stats lists every relay group id. Callers (ops dashboard server, wavepark-master)
+// do not all send x-master-key yet, so enforcement is GATED: set STATS_REQUIRE_MASTER_KEY=true
+// once the "[STATS] unauthenticated caller" log line has stopped appearing.
+const STATS_REQUIRE_MASTER_KEY = process.env.STATS_REQUIRE_MASTER_KEY === 'true';
+const statsUnauthLogged = new Map();   // ip -> last time we logged it (bounded, 1 line/ip/hour)
+function clientIp(req) {
+  // Railway's edge APPENDS the real client IP, so the right-most hop is the one to trust.
+  const xff = String(req.headers['x-forwarded-for'] || '');
+  const hops = xff.split(',').map(h => h.trim()).filter(Boolean);
+  return hops.length ? hops[hops.length - 1] : (req.socket && req.socket.remoteAddress) || '?';
+}
+function noteUnauthStats(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  if (now - (statsUnauthLogged.get(ip) || 0) < 3600000) return;
+  if (statsUnauthLogged.size > 1000) statsUnauthLogged.clear();
+  statsUnauthLogged.set(ip, now);
+  console.warn(`[STATS] unauthenticated caller ip=${ip} ua=${String(req.headers['user-agent'] || '').slice(0, 80)}` +
+    (STATS_REQUIRE_MASTER_KEY ? ' (refused)' : ' (allowed: STATS_REQUIRE_MASTER_KEY not set)'));
 }
 
 // ── S2: dedicated master authority ───────────────────────────────────────────
 // Only a connection presenting this secret may join as role=master (and thus
 // broadcast order/close/stop/target frames). Children never have it.
-// GATED: enforcement is OFF until ENFORCE_MASTER_SECRET=true, so we can deploy S1
-// (child validation) first and flip S2 on the instant the patched master is live —
-// no flag-day, no risk of rejecting the current master.
+// MANDATORY: if RELAY_MASTER_SECRET is unset every master is refused (fail closed).
+// ENFORCE_MASTER_SECRET is no longer read for this decision (it was the S1->S2 rollout gate,
+// and is already 'true' in production).
 const RELAY_MASTER_SECRET = process.env.RELAY_MASTER_SECRET;
-const ENFORCE_MASTER_SECRET = process.env.ENFORCE_MASTER_SECRET === 'true';
+if (!RELAY_MASTER_SECRET) {
+  console.error('[CONFIG] RELAY_MASTER_SECRET is unset — ALL master connections will be refused (fail closed)');
+}
+if (process.env.ENFORCE_MASTER_SECRET && process.env.ENFORCE_MASTER_SECRET !== 'true') {
+  console.warn('[CONFIG] ENFORCE_MASTER_SECRET is ignored: the master secret is always enforced');
+}
 
 // ── S1: license-backed connection validation ─────────────────────────────────
 // The relay validates a child's (group, apiKey) against the SAME deterministic
 // credential derivation the licensing server uses, over the set of currently
 // active licenses. Read directly from Supabase REST (no extra npm dependency).
-// FAIL-OPEN: if the license cache has never loaded (e.g. Supabase unreachable),
-// connections are ALLOWED so an infra blip can never disconnect paying users.
+// Cache rules:
+//  * Already-connected children are NEVER re-checked or kicked by anything here.
+//  * After a successful load, a failed (or suspiciously empty) refresh keeps the last good
+//    cache, so a Supabase blip can never lock out paying customers.
+//  * During a startup grace (LICENSE_GRACE_MS) before the FIRST successful load, new children
+//    are allowed (fail-open, as before). After the grace, if the cache has still never loaded,
+//    new children with keys we cannot verify are REFUSED (fail closed). They auto-reconnect
+//    and get in as soon as a load succeeds. Emergency override: RELAY_CHILD_FAIL_OPEN=true.
+//  * A cache miss triggers at most ONE Supabase refetch per REFRESH_ON_MISS_MIN_MS, shared by
+//    every concurrent miss (stops rejected children from hammering Supabase egress).
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const LICENSE_GRACE_MS = 60000;
+const REFRESH_ON_MISS_MIN_MS = 10000;
+const CHILD_FAIL_OPEN = process.env.RELAY_CHILD_FAIL_OPEN === 'true';
 
 // EXACT copy of licensing generateUserCredentials — must stay identical or child
 // apiKeys (issued by /api/activate) won't validate here.
@@ -66,10 +113,14 @@ function httpsGetJson(fullUrl, headers) {
 }
 
 let licenseCache = { rows: [], loaded: false, at: 0 };
+let refreshInFlight = null;      // the one Supabase fetch currently running (coalesced)
+let missRefresh = null;          // the one pending refresh-on-miss (shared by all misses)
+let lastRefreshStartedAt = 0;
 
-async function refreshLicenses() {
+async function doRefreshLicenses() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.warn('[LICENSES] SUPABASE_URL / SUPABASE_SERVICE_KEY unset — child validation running FAIL-OPEN');
+    console.warn('[LICENSES] SUPABASE_URL / SUPABASE_SERVICE_KEY unset — license cache cannot load' +
+      (CHILD_FAIL_OPEN ? ' (RELAY_CHILD_FAIL_OPEN=true: children allowed)' : ' (new children refused after startup grace)'));
     return;
   }
   try {
@@ -80,12 +131,39 @@ async function refreshLicenses() {
       Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
     });
     if (Array.isArray(rows)) {
+      if (rows.length === 0 && licenseCache.loaded && licenseCache.rows.length > 0) {
+        // An empty answer after a good load looks like a DB/RLS blip, not every customer
+        // cancelling at once. Keep the last good cache rather than refuse paying customers.
+        console.warn(`[LICENSES] refresh returned 0 rows (had ${licenseCache.rows.length}) — keeping previous cache`);
+        return;
+      }
       licenseCache = { rows, loaded: true, at: Date.now() };
       console.log(`[LICENSES] cache refreshed: ${rows.length} active license(s)`);
     }
   } catch (e) {
     console.error('[LICENSES] refresh failed (keeping previous cache):', e.message);
   }
+}
+
+// Coalesced: concurrent callers share the in-flight fetch.
+function refreshLicenses() {
+  if (refreshInFlight) return refreshInFlight;
+  lastRefreshStartedAt = Date.now();
+  refreshInFlight = doRefreshLicenses().finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
+}
+
+// Rate-limited refresh for a cache miss: at most one per REFRESH_ON_MISS_MIN_MS. A miss inside
+// the window waits for the next allowed refresh (so a just-activated child is still let in,
+// a few seconds later) instead of triggering its own fetch.
+function refreshOnMiss() {
+  if (refreshInFlight) return refreshInFlight;
+  if (missRefresh) return missRefresh;
+  const wait = Math.max(0, lastRefreshStartedAt + REFRESH_ON_MISS_MIN_MS - Date.now());
+  missRefresh = new Promise((resolve) => setTimeout(resolve, wait))
+    .then(() => refreshLicenses())
+    .finally(() => { missRefresh = null; });
+  return missRefresh;
 }
 
 function isEligible(lic, strategy, now) {
@@ -208,6 +286,14 @@ const server = http.createServer((req, res) => {
 
   // API ENDPOINT: Read-only stats for internal dashboard (no apiKeys leaked)
   if (parsedUrl.pathname === '/stats' && req.method === 'GET') {
+    if (!adminAuthed(req)) {
+      noteUnauthStats(req);
+      if (STATS_REQUIRE_MASTER_KEY) {
+        res.writeHead(401, {"Content-Type": "application/json"});
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+    }
     maybeRollMessagesToday();
     const groups = [];
     for (const [group, s] of groupStats) {
@@ -295,16 +381,12 @@ wss.on("connection", async (ws, req) => {
 
   // ── S1/S2 connection validation ────────────────────────────────────────────
   if (role === "master") {
-    // S2: require the dedicated master secret — ONLY once ENFORCE_MASTER_SECRET=true
-    // AND the secret is configured. Until then, allow masters through (S1-only phase).
-    if (ENFORCE_MASTER_SECRET && RELAY_MASTER_SECRET) {
-      if (secret !== RELAY_MASTER_SECRET) {
-        console.log(`[REJECT] master -> ${group}: missing/invalid master secret`);
-        ws.close();
-        return;
-      }
-    } else {
-      console.warn(`[WARN] master secret NOT enforced yet (ENFORCE_MASTER_SECRET=${ENFORCE_MASTER_SECRET}) — allowing master -> ${group}`);
+    // S2: the dedicated master secret is mandatory. Unset secret = no masters (fail closed).
+    if (!RELAY_MASTER_SECRET || !safeEqual(secret, RELAY_MASTER_SECRET)) {
+      console.log(`[REJECT] master -> ${group}: missing/invalid master secret` +
+        (RELAY_MASTER_SECRET ? '' : ' (RELAY_MASTER_SECRET unset on relay)'));
+      ws.close();
+      return;
     }
   } else if (role === "child") {
     if (!key) {
@@ -313,22 +395,27 @@ wss.on("connection", async (ws, req) => {
       return;
     }
     // S1: validate the child's (group, apiKey) against active licenses.
-    // FAIL-OPEN only when the cache has never loaded (infra issue).
-    if (licenseCache.loaded) {
-      let ok = matchesChild(group, key, strategy);
+    const inGrace = Date.now() - processStartedAt < LICENSE_GRACE_MS;
+    if (!licenseCache.loaded && (CHILD_FAIL_OPEN || inGrace)) {
+      console.warn(`[WARN] license cache not loaded — allowing child -> ${group} (fail-open: ${CHILD_FAIL_OPEN ? 'RELAY_CHILD_FAIL_OPEN' : 'startup grace'})`);
+    } else {
+      let ok = licenseCache.loaded && matchesChild(group, key, strategy);
       if (!ok) {
-        // A just-activated child may not be in the cache yet — refresh once, re-check.
-        await refreshLicenses();
-        ok = matchesChild(group, key, strategy);
+        // A just-activated child may not be in the cache yet (or the cache never loaded) —
+        // wait for the next rate-limited, shared refresh, then re-check once.
+        await refreshOnMiss();
+        ok = licenseCache.loaded && matchesChild(group, key, strategy);
       }
+      if (!ok && !licenseCache.loaded && CHILD_FAIL_OPEN) ok = true;
       if (!ok) {
-        console.log(`[REJECT] child -> ${group}: apiKey not tied to an active license (strategy=${strategy})`);
+        console.log(`[REJECT] child -> ${group}: ` +
+          (licenseCache.loaded ? `apiKey not tied to an active license (strategy=${strategy})`
+                               : 'license cache has never loaded — cannot verify (fail closed)'));
         ws.close();
         return;
       }
-    } else {
-      console.warn(`[WARN] license cache not loaded — allowing child -> ${group} (fail-open)`);
     }
+    if (ws.readyState !== WebSocket.OPEN) return;   // socket went away while we were checking
   } else {
     console.log(`[REJECT] unknown role: ${role}`);
     ws.close();
